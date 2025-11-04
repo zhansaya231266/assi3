@@ -1,347 +1,437 @@
-// Controls:
-//  A / D : decrease / increase angle (theta)
-//  W / S : increase / decrease camera height (H)
-//  Q / E : decrease / increase orbit radius (R)
-//  P     : toggle projection (perspective / orthographic)
-//  R     : reset camera params
-//  ESC   : exit
-
-#include <iostream>
-#include <vector>
-#include <string>
+﻿#include <iostream>
 #include <fstream>
-#include <sstream>
+#include <vector>
 #include <cmath>
+#include <sstream>
 #include <algorithm>
-#include <array>
-
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
+// constants
+const unsigned int SCR_WIDTH = 800;
+const unsigned int SCR_HEIGHT = 600;
+const float PI = 3.1415926535f;
+
+// camera parameters 
+float camera_radius = 5.0f; 
+float camera_angle = PI / 4.0f; 
+float camera_height = 0.5f; 
+
+bool is_perspective = true; 
+float last_key_press_time = 0.0f;
+float key_debounce_time = 0.2f;
+
+GLuint shaderProgram;
+GLuint VBO, VAO;
+
 struct Vec3 {
     float x, y, z;
-    Vec3() : x(0), y(0), z(0) {}
-    Vec3(float _x, float _y, float _z) : x(_x), y(_y), z(_z) {}
 };
-static inline Vec3 operator-(const Vec3& a, const Vec3& b) { return Vec3(a.x - b.x, a.y - b.y, a.z - b.z); }
-static inline Vec3 operator+(const Vec3& a, const Vec3& b) { return Vec3(a.x + b.x, a.y + b.y, a.z + b.z); }
-static inline Vec3 operator*(const Vec3& a, float s) { return Vec3(a.x * s, a.y * s, a.z * s); }
-static inline Vec3 cross(const Vec3& a, const Vec3& b) {
-    return Vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
-}
-static inline float len(const Vec3& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
-static inline Vec3 normalize(const Vec3& v) { float L = len(v); if (L == 0) return Vec3(0, 0, 0); return Vec3(v.x / L, v.y / L, v.z / L); }
 
-std::vector<Vec3> vertices;
-std::vector<std::array<int, 3>> faces;
-std::vector<Vec3> faceNormals;
-Vec3 modelCentroid(0, 0, 0);
-float modelScale = 1.0f;
+struct Mat4 {
+    float m[16];
+};
 
-// camera (cylindrical)
-float camTheta = 0.0f;
-float camRadius = 3.0f;
-float camHeight = 0.0f;
-bool usePerspective = true;
 
-int winW = 1024, winH = 768;
+// vector operations
+Vec3 operator-(const Vec3& a, const Vec3& b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+Vec3 operator+(const Vec3& a, const Vec3& b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+Vec3 operator*(const Vec3& v, float s) { return { v.x * s, v.y * s, v.z * s }; }
 
-const float PI = 3.14159265358979323846f;
-static float viewFactor = 4.0f;
+float magnitude(const Vec3& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
 
-// steps
-const float DTH = 4.0f * PI / 180.0f; 
-const float DR = 0.1f;
-const float DH = 0.1f;
-
-// matrix helpers (column-major) 
-static std::array<float, 16> createPerspectiveMatrix(float fovy_radians, float aspect, float znear, float zfar) {
-    float f = 1.0f / tanf(fovy_radians * 0.5f);
-    std::array<float, 16> m{};
-    // column-major: m[col*4 + row]
-    m[0] = f / aspect; m[4] = 0.0f; m[8] = 0.0f;                      m[12] = 0.0f;
-    m[1] = 0.0f;       m[5] = f;    m[9] = 0.0f;                      m[13] = 0.0f;
-    m[2] = 0.0f;       m[6] = 0.0f; m[10] = (zfar + znear) / (znear - zfar); m[14] = (2.0f * zfar * znear) / (znear - zfar);
-    m[3] = 0.0f;       m[7] = 0.0f; m[11] = -1.0f;                     m[15] = 0.0f;
-    return m;
+Vec3 normalize(const Vec3& v) {
+    float len = magnitude(v);
+    if (len > 0.00001f) {
+        return { v.x / len, v.y / len, v.z / len };
+    }
+    return { 0.0f, 0.0f, 0.0f };
 }
 
-static std::array<float, 16> createLookAtMatrix(float eyeX, float eyeY, float eyeZ,
-    float centerX, float centerY, float centerZ,
-    float upX, float upY, float upZ)
-{
-    // compute forward vector f = normalize(center - eye)
-    float fx = centerX - eyeX;
-    float fy = centerY - eyeY;
-    float fz = centerZ - eyeZ;
-    float flen = sqrtf(fx * fx + fy * fy + fz * fz);
-    if (flen == 0.0f) flen = 1.0f;
-    fx /= flen; fy /= flen; fz /= flen;
-
-    // normalize up
-    float ux = upX, uy = upY, uz = upZ;
-    float ulen = sqrtf(ux * ux + uy * uy + uz * uz);
-    if (ulen == 0.0f) ulen = 1.0f;
-    ux /= ulen; uy /= ulen; uz /= ulen;
-
-    // s = f x up
-    float sx = fy * uz - fz * uy;
-    
-    float sy = fz * ux - fx * uz;
-    float sz = fx * uy - fy * ux;
-    float slen = sqrtf(sx * sx + sy * sy + sz * sz);
-    if (slen == 0.0f) slen = 1.0f;
-    sx /= slen; sy /= slen; sz /= slen;
-
-    // u = s x f
-    float ux2 = sy * fz - sz * fy;
-    float uy2 = sz * fx - sx * fz;
-    float uz2 = sx * fy - sy * fx;
-
-    // translation t = -R * eye (where R = [s; u; -f] rows)
-    float tx = -(sx * eyeX + sy * eyeY + sz * eyeZ);
-    float ty = -(ux2 * eyeX + uy2 * eyeY + uz2 * eyeZ);
-    float tz = (fx * eyeX + fy * eyeY + fz * eyeZ); 
-
-    std::array<float, 16> m{};
-    m[0] = sx;   m[4] = ux2;  m[8] = -fx;  m[12] = 0.0f;
-    m[1] = sy;   m[5] = uy2;  m[9] = -fy;  m[13] = 0.0f;
-    m[2] = sz;   m[6] = uz2;  m[10] = -fz;  m[14] = 0.0f;
-    m[3] = tx;   m[7] = ty;   m[11] = tz;   m[15] = 1.0f;
-    return m;
+// vector products
+Vec3 cross(const Vec3& a, const Vec3& b) {
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    };
 }
+
+// scalar product
+float dot(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+// matrix operations
+Mat4 Mat4_Identity() {
+    Mat4 res = { 0 };
+    res.m[0] = res.m[5] = res.m[10] = res.m[15] = 1.0f; 
+    return res;
+}
+
+// multiply two 4x4 matrices 
+Mat4 Mat4_Multiply(const Mat4& A, const Mat4& B) {
+    Mat4 C = { 0 };
+    for (int i = 0; i < 4; ++i) { 
+        for (int j = 0; j < 4; ++j) { 
+            for (int k = 0; k < 4; ++k) {
+                C.m[4 * j + i] += A.m[4 * k + i] * B.m[4 * j + k];
+            }
+        }
+    }
+    return C;
+}
+
+// view matrix
+Mat4 Mat4_LookAt(Vec3 eye, Vec3 center, Vec3 up) {
+    Vec3 f = normalize(center - eye); 
+    Vec3 s = normalize(cross(f, normalize(up))); 
+    Vec3 u = cross(s, f); 
+
+    Mat4 R = Mat4_Identity();
+    R.m[0] = s.x; R.m[4] = s.y; R.m[8] = s.z;
+    R.m[1] = u.x; R.m[5] = u.y; R.m[9] = u.z;
+    R.m[2] = -f.x; R.m[6] = -f.y; R.m[10] = -f.z;
+
+    Mat4 T = Mat4_Identity();
+    T.m[12] = -eye.x;
+    T.m[13] = -eye.y;
+    T.m[14] = -eye.z;
+
+    return Mat4_Multiply(R, T);
+}
+
+// projection matrices
+Mat4 Mat4_Perspective(float fov, float aspect, float near, float far) {
+    Mat4 res = { 0 };
+    float tanHalfFov = std::tan(fov / 2.0f);
+
+    res.m[0] = 1.0f / (aspect * tanHalfFov);
+    res.m[5] = 1.0f / tanHalfFov;
+    res.m[10] = -(far + near) / (far - near);
+    res.m[11] = -1.0f;
+    res.m[14] = -(2.0f * far * near) / (far - near);
+
+    return res;
+}
+
+// orthographic projection
+Mat4 Mat4_Orthographic(float left, float right, float bottom, float top, float near, float far) {
+    Mat4 res = Mat4_Identity();
+
+    res.m[0] = 2.0f / (right - left);
+    res.m[5] = 2.0f / (top - bottom);
+    res.m[10] = -2.0f / (far - near);
+    res.m[12] = -(right + left) / (right - left);
+    res.m[13] = -(top + bottom) / (top - bottom);
+    res.m[14] = -(far + near) / (far - near);
+
+    return res;
+}
+
+struct Vertex {
+    Vec3 position;
+};
+
+struct FaceData {
+    unsigned int v1, v2, v3;
+    Vec3 color; 
+};
+
+std::vector<Vertex> vertices;
+std::vector<FaceData> faces;
+std::vector<float> vertexBufferData; 
+
+void framebuffer_size_callback(GLFWwindow* window, int width, int height);
+void processInput(GLFWwindow* window);
+void checkShaderCompileErrors(unsigned int shader, std::string type);
+void setupShaders();
 
 // SMF loader
-bool loadSMF(const std::string& fname) {
-    std::ifstream in(fname);
-    if (!in.is_open()) return false;
-    vertices.clear(); faces.clear();
+void loadSMF(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "ERROR::SMF_LOADER::File not successfully read: " << filename << std::endl;
+        exit(-1);
+    }
+
     std::string line;
-    while (std::getline(in, line)) {
-        if (line.empty()) continue;
-        std::istringstream iss(line);
-        std::string t; iss >> t;
-        if (t == "v") {
-            float x, y, z; iss >> x >> y >> z;
-            vertices.emplace_back(x, y, z);
+    while (std::getline(file, line)) {
+        std::stringstream ss(line);
+        std::string type;
+        ss >> type;
+
+        if (type == "v") {
+            float x, y, z;
+            ss >> x >> y >> z;
+            vertices.push_back({ {x, y, z} });
         }
-        else if (t == "f") {
-            int a, b, c; if (!(iss >> a >> b >> c)) continue;
-            faces.push_back({ a - 1,b - 1,c - 1 });
+        else if (type == "f") {
+            unsigned int v1, v2, v3;
+            ss >> v1 >> v2 >> v3;
+            faces.push_back({ v1 - 1, v2 - 1, v3 - 1, {0.0f, 0.0f, 0.0f} });
         }
     }
-    in.close();
-    return (!vertices.empty() && !faces.empty());
+
+    file.close();
+    std::cout << "Model loaded: " << vertices.size() << " vertices, " << faces.size() << " triangles." << std::endl;
 }
 
-// UV sphere if no model provided 
-void makeUVSphere(int stacks = 20, int sectors = 40, float radius = 1.0f) {
-    vertices.clear(); faces.clear();
-    for (int i = 0;i <= stacks;i++) {
-        float V = (float)i / (float)stacks;
-        float phi = V * PI;
-        for (int j = 0;j <= sectors;j++) {
-            float U = (float)j / (float)sectors;
-            float theta = U * 2.0f * PI;
-            float x = std::cos(theta) * std::sin(phi);
-            float y = std::sin(theta) * std::sin(phi);
-            float z = std::cos(phi);
-            vertices.emplace_back(x * radius, y * radius, z * radius);
-        }
-    }
-    int cols = sectors + 1;
-    for (int i = 0;i < stacks;i++) {
-        for (int j = 0;j < sectors;j++) {
-            int v1 = i * cols + j;
-            int v2 = v1 + cols;
-            int v3 = v2 + 1;
-            int v4 = v1 + 1;
-            // two triangles v1,v2,v3 and v1,v3,v4
-            faces.push_back({ v1,v2,v3 });
-            faces.push_back({ v1,v3,v4 });
-        }
+// model processing
+void calculateFaceNormals() {
+    for (auto& face : faces) {
+        Vec3 p1 = vertices[face.v1].position;
+        Vec3 p2 = vertices[face.v2].position;
+        Vec3 p3 = vertices[face.v3].position;
+
+        Vec3 edge1 = p2 - p1;
+        Vec3 edge2 = p3 - p1;
+
+        Vec3 normal = cross(edge1, edge2);
+
+        Vec3 normal_normalized = normalize(normal);
+
+        face.color.x = std::abs(normal_normalized.x);
+        face.color.y = std::abs(normal_normalized.y);
+        face.color.z = std::abs(normal_normalized.z);
     }
 }
 
-// -----------------------------------------------------
-void computeModelInfo() {
-    if (vertices.empty()) return;
-    float sx = 0, sy = 0, sz = 0;
-    for (auto& v : vertices) { sx += v.x; sy += v.y; sz += v.z; }
-    float n = (float)vertices.size();
-    modelCentroid = Vec3(sx / n, sy / n, sz / n);
-    float maxd = 0.0f;
-    for (auto& v : vertices) {
-        Vec3 d = v - modelCentroid;
-        float dist = len(d);
-        if (dist > maxd) maxd = dist;
-    }
-    modelScale = (maxd > 0.0f) ? maxd : 1.0f;
-    // set sensible camera defaults
-    camRadius = modelScale * viewFactor;
-    camHeight = 0.0f;
-    camTheta = 0.0f;
-}
 
-// -----------------------------------------------------
-void computeFaceNormals() {
-    faceNormals.clear();
-    faceNormals.reserve(faces.size());
-    for (auto& f : faces) {
-        Vec3 v1 = vertices[f[0]];
-        Vec3 v2 = vertices[f[1]];
-        Vec3 v3 = vertices[f[2]];
-        Vec3 e1 = v2 - v1;
-        Vec3 e2 = v3 - v1;
-        Vec3 n = cross(e1, e2);
-        n = normalize(n);
-        faceNormals.push_back(n);
-    }
-}
+// buffer setup
+void setupBuffers() {
+    vertexBufferData.reserve(faces.size() * 3 * 6);
+    for (const auto& face : faces) {
+        for (int i = 0; i < 3; ++i) {
+            unsigned int v_index = (i == 0) ? face.v1 : ((i == 1) ? face.v2 : face.v3);
+            const Vec3& pos = vertices[v_index].position;
 
-// -----------------------------------------------------
-void processInput(GLFWwindow* window) {
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) camTheta -= DTH;
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) camTheta += DTH;
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) camHeight += DH;
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) camHeight -= DH;
-    if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) camRadius = std::max(0.01f, camRadius - DR);
-    if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) camRadius += DR;
-    if (glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS) camRadius += 0.05f * modelScale; 
-    if (glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS) camRadius = std::max(0.01f, camRadius - 0.05f * modelScale); 
-    if (glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS) {
-        static double last = 0;
-        double t = glfwGetTime();
-        if (t - last > 0.25) { usePerspective = !usePerspective; last = t; }
-    }
-    if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS) {
-        static double last = 0;
-        double t = glfwGetTime();
-        if (t - last > 0.25) {
-            camRadius = modelScale * 3.0f;
-            camHeight = 0.0f; camTheta = 0.0f;
-            last = t;
+            vertexBufferData.push_back(pos.x);
+            vertexBufferData.push_back(pos.y);
+            vertexBufferData.push_back(pos.z);
+            vertexBufferData.push_back(face.color.x);
+            vertexBufferData.push_back(face.color.y);
+            vertexBufferData.push_back(face.color.z);
         }
     }
-    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) glfwSetWindowShouldClose(window, true);
+
+    glGenVertexArrays(1, &VAO);
+    glGenBuffers(1, &VBO);
+
+    glBindVertexArray(VAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, vertexBufferData.size() * sizeof(float), vertexBufferData.data(), GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
 }
 
-// -----------------------------------------------------
-void render() {
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    glEnable(GL_DEPTH_TEST);
-    glShadeModel(GL_FLAT);
-    glDisable(GL_LIGHTING);
+// matrix updates
+Mat4 updateViewMatrix() {
+    const Vec3 lookAtPoint = { 0.0f, 0.0f, 0.0f };
+    const Vec3 upVector = { 0.0f, 1.0f, 0.0f };
 
-    // projection
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    float aspect = (winH == 0) ? 1.0f : (float)winW / (float)winH;
-    if (usePerspective) {
-        auto proj = createPerspectiveMatrix(45.0f * PI / 180.0f, aspect, 0.01f * modelScale, 100.0f * modelScale);
-        glLoadMatrixf(proj.data());
+	// calculate camera position in Cartesian coordinates
+    // X = R * cos(θ)
+    // Z = R * sin(θ)
+    // Y = H
+    float x = camera_radius * std::cos(camera_angle);
+    float z = camera_radius * std::sin(camera_angle);
+    float y = camera_height;
+
+    Vec3 cameraPos = { x, y, z };
+
+    return Mat4_LookAt(cameraPos, lookAtPoint, upVector);
+}
+
+// projection matrix update
+Mat4 updateProjectionMatrix(float aspect) {
+    if (is_perspective) {
+        return Mat4_Perspective(PI / 4.0f, aspect, 0.1f, 100.0f);
     }
     else {
-        float s = modelScale * 1.5f;
-        if (aspect >= 1.0f) {
-            glOrtho(-s * aspect, s * aspect, -s, s, -1000.0f * modelScale, 1000.0f * modelScale);
-        }
-        else {
-            glOrtho(-s, s, -s / aspect, s / aspect, -1000.0f * modelScale, 1000.0f * modelScale);
-        }
+        float size = camera_radius / 3.0f;
+        return Mat4_Orthographic(-size * aspect, size * aspect, -size, size, 0.1f, 100.0f);
     }
-
-    // view
-    float camX = camRadius * std::cos(camTheta);
-    float camY = camRadius * std::sin(camTheta);
-    float camZ = camHeight;
-    auto view = createLookAtMatrix(camX, camY, camZ,
-        0.0f, 0.0f, 0.0f,
-        0.0f, 0.0f, 1.0f);
-    glMatrixMode(GL_MODELVIEW);
-    glLoadMatrixf(view.data());
-
-    // draw axes (optional)
-    glDisable(GL_LIGHTING);
-    glBegin(GL_LINES);
-    glColor3f(1, 0, 0); glVertex3f(0, 0, 0); glVertex3f(modelScale * 0.5f, 0, 0);
-    glColor3f(0, 1, 0); glVertex3f(0, 0, 0); glVertex3f(0, modelScale * 0.5f, 0);
-    glColor3f(0, 0, 1); glVertex3f(0, 0, 0); glVertex3f(0, 0, modelScale * 0.5f);
-    glEnd();
-
-    // draw model centered at origin and scaled to unit radius: v' = (v - centroid) / modelScale
-    glBegin(GL_TRIANGLES);
-    for (size_t i = 0;i < faces.size();++i) {
-        Vec3 n = faceNormals[i];
-        // color = abs(normal)
-        glColor3f(std::abs(n.x), std::abs(n.y), std::abs(n.z));
-        // set normal (for completeness)
-        glNormal3f(n.x, n.y, n.z);
-        auto& f = faces[i];
-        for (int k = 0;k < 3;k++) {
-            Vec3 v = vertices[f[k]];
-            Vec3 vt = (v - modelCentroid) * (1.0f / modelScale);
-            glVertex3f(vt.x, vt.y, vt.z);
-        }
-    }
-    glEnd();
 }
 
-// -----------------------------------------------------
-void framebuffer_size_cb(GLFWwindow* window, int w, int h) {
-    (void)window;
-    winW = w; winH = h;
-    glViewport(0, 0, w, h);
+// shader setup
+void setupShaders() {
+    const char* vertexShaderSource = R"(
+        #version 330 core
+        layout (location = 0) in vec3 aPos;
+        layout (location = 1) in vec3 aColor;
+
+        out vec3 ourColor;
+
+        uniform mat4 model;
+        uniform mat4 view;
+        uniform mat4 projection;
+
+        void main() {
+            gl_Position = projection * view * model * vec4(aPos, 1.0);
+            ourColor = aColor; 
+        }
+    )";
+
+    unsigned int vertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
+    glCompileShader(vertexShader);
+    checkShaderCompileErrors(vertexShader, "VERTEX");
+
+    const char* fragmentShaderSource = R"(
+        #version 330 core
+        out vec4 FragColor;
+        in vec3 ourColor;
+
+        void main() {
+            FragColor = vec4(ourColor, 1.0f); 
+        }
+    )";
+    unsigned int fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
+    glCompileShader(fragmentShader);
+    checkShaderCompileErrors(fragmentShader, "FRAGMENT");
+
+    shaderProgram = glCreateProgram();
+    glAttachShader(shaderProgram, vertexShader);
+    glAttachShader(shaderProgram, fragmentShader);
+    glLinkProgram(shaderProgram);
+    checkShaderCompileErrors(shaderProgram, "PROGRAM");
+
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
 }
 
-// -----------------------------------------------------
-int main(int argc, char** argv) {
-    std::string fname;
-    if (argc >= 2) fname = argv[1];
-
-    // init GLFW
-    if (!glfwInit()) {
-        std::cerr << "Failed to init GLFW\n"; return -1;
+void checkShaderCompileErrors(unsigned int shader, std::string type) {
+    int success;
+    char infoLog[1024];
+    if (type != "PROGRAM") {
+        glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+        if (!success) {
+            glGetShaderInfoLog(shader, 1024, NULL, infoLog);
+            std::cerr << "ERROR::SHADER_COMPILATION_ERROR of type: " << type << "\n" << infoLog << "\n" << std::endl;
+        }
     }
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
-    // create window
-    GLFWwindow* window = glfwCreateWindow(winW, winH, "Part1: SMF Viewer", nullptr, nullptr);
-    if (!window) { std::cerr << "Failed to create GLFW window\n"; glfwTerminate(); return -1; }
+    else {
+        glGetProgramiv(shader, GL_LINK_STATUS, &success);
+        if (!success) {
+            glGetProgramInfoLog(shader, 1024, NULL, infoLog);
+            std::cerr << "ERROR::PROGRAM_LINKING_ERROR of type: " << type << "\n" << infoLog << "\n" << std::endl;
+        }
+    }
+}
+
+// process input
+void processInput(GLFWwindow* window) {
+    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        glfwSetWindowShouldClose(window, true);
+
+    float current_time = (float)glfwGetTime();
+    float camera_speed = 0.05f;
+    float angle_speed = 0.02f;
+
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+        camera_angle += angle_speed;
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+        camera_angle -= angle_speed;
+
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+        camera_radius = std::max(0.5f, camera_radius - camera_speed);
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+        camera_radius += camera_speed;
+
+    if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS)
+        camera_height += camera_speed;
+    if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS)
+        camera_height -= camera_speed;
+
+    if (glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS && current_time - last_key_press_time > key_debounce_time) {
+        is_perspective = !is_perspective;
+        last_key_press_time = current_time;
+        std::cout << "Projection switched to: " << (is_perspective ? "Perspective" : "Parallel (Orthographic)") << std::endl;
+    }
+}
+
+void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    glViewport(0, 0, width, height);
+}
+
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <smf_filename>" << std::endl;
+        return -1;
+    }
+    std::string smf_filename = argv[1];
+
+    glfwInit();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Part 1", NULL, NULL);
+    if (window == NULL) {
+        std::cerr << "Failed to create GLFW window" << std::endl;
+        glfwTerminate();
+        return -1;
+    }
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1);
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
 
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-        std::cerr << "Failed to initialize GLAD\n"; return -1;
+        std::cerr << "Failed to initialize GLAD" << std::endl;
+        return -1;
     }
 
-    glfwSetFramebufferSizeCallback(window, framebuffer_size_cb);
+    glEnable(GL_DEPTH_TEST);
 
-    // load smf
-    bool loaded = false;
-    if (!fname.empty()) {
-        loaded = loadSMF(fname);
-        if (!loaded) std::cerr << "Warning: failed to load SMF '" << fname << "'. Generating sphere.\n";
-    }
-    if (!loaded) {
-        makeUVSphere(30, 40, 1.0f);
-    }
+    loadSMF(smf_filename);
+    calculateFaceNormals();
 
-    computeModelInfo();
-    computeFaceNormals();
+    setupShaders();
+    setupBuffers();
 
-    std::cout << "Vertices: " << vertices.size() << ", Faces: " << faces.size() << "\n";
-    std::cout << "Controls: A/D angle | W/S height | Q/E radius | P toggle proj | R reset | ESC exit | Z/X zoom out/in \n";
+	std::cout << "Controls: A/D angle | W/S zoom in/zoom out | Up/Down camera up/down | P toogle proj\n";
 
-    // main loop
+    // rendering
     while (!glfwWindowShouldClose(window)) {
         processInput(window);
-        render();
+
+        glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glUseProgram(shaderProgram);
+
+        Mat4 model = Mat4_Identity();
+        Mat4 view = updateViewMatrix();
+        int width, height;
+        glfwGetFramebufferSize(window, &width, &height);
+        float aspect = (float)width / (float)height;
+        Mat4 projection = updateProjectionMatrix(aspect);
+
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, model.m);
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, view.m);
+        glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, projection.m);
+
+        glBindVertexArray(VAO);
+        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)vertexBufferData.size() / 6);
+
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
 
-    glfwDestroyWindow(window);
+    glDeleteVertexArrays(1, &VAO);
+    glDeleteBuffers(1, &VBO);
+    glDeleteProgram(shaderProgram);
+
     glfwTerminate();
     return 0;
 }
