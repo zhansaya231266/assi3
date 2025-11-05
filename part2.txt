@@ -1,0 +1,780 @@
+part 2.txt
+
+
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <cmath>
+#include <sstream>
+#include <algorithm>
+#include <map> 
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+
+// constants
+const unsigned int SCR_WIDTH = 800;
+const unsigned int SCR_HEIGHT = 600;
+const float PI = 3.1415926535f;
+
+struct Vec3 { float x, y, z; };
+struct Vec4 { float x, y, z, w; };
+struct Mat4 { float m[16]; };
+
+// vector operations
+Vec3 operator-(const Vec3& a, const Vec3& b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+Vec3 operator+(const Vec3& a, const Vec3& b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+Vec3 operator*(const Vec3& v, float s) { return { v.x * s, v.y * s, v.z * s }; }
+
+float magnitude(const Vec3& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
+
+Vec3 normalize(const Vec3& v) {
+    float len = magnitude(v);
+    if (len > 0.00001f) {
+        return { v.x / len, v.y / len, v.z / len };
+    }
+    return { 0.0f, 0.0f, 0.0f };
+}
+
+// vector products
+Vec3 cross(const Vec3& a, const Vec3& b) {
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    };
+}
+
+// scalar product
+float dot(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+// camera parameters 
+float camera_radius = 5.0f;
+float camera_angle = PI / 4.0f;
+float camera_height = 0.5f;
+
+bool is_perspective = true;
+float last_key_press_time = 0.0f;
+float key_debounce_time = 0.2f;
+
+enum ShadingMode { GOURAUD, PHONG };
+ShadingMode current_shading_mode = PHONG;
+int current_material_index = 0;
+
+// Light 1 (World Coordinates - Cylindrical Motion)
+float light1_radius = 3.0f;
+float light1_angle = 0.0f;
+float light1_height = 2.0f;
+
+// Light 2 (Camera Coordinates - Near Eye Point)
+const Vec3 light2_position_cam = { 0.0f, 0.0f, -0.1f }; 
+
+GLuint shaderProgram_gouraud;
+GLuint shaderProgram_phong;
+GLuint VBO, VAO;
+
+// matrix operations
+Mat4 Mat4_Identity() {
+    Mat4 res = { 0 };
+    res.m[0] = res.m[5] = res.m[10] = res.m[15] = 1.0f;
+    return res;
+}
+
+// multiply two 4x4 matrices 
+Mat4 Mat4_Multiply(const Mat4& A, const Mat4& B) {
+    Mat4 C = { 0 };
+    for (int i = 0; i < 4; ++i) { 
+        for (int j = 0; j < 4; ++j) { 
+            for (int k = 0; k < 4; ++k) {
+                C.m[4 * j + i] += A.m[4 * k + i] * B.m[4 * j + k];
+            }
+        }
+    }
+    return C;
+}
+
+// view matrix
+Mat4 Mat4_LookAt(Vec3 eye, Vec3 center, Vec3 up) {
+    Vec3 f = normalize(center - eye);
+    Vec3 s = normalize(cross(f, normalize(up)));
+    Vec3 u = cross(s, f);
+
+    Mat4 R = Mat4_Identity();
+    R.m[0] = s.x; R.m[4] = s.y; R.m[8] = s.z;
+    R.m[1] = u.x; R.m[5] = u.y; R.m[9] = u.z;
+    R.m[2] = -f.x; R.m[6] = -f.y; R.m[10] = -f.z;
+
+    Mat4 T = Mat4_Identity();
+    T.m[12] = -eye.x;
+    T.m[13] = -eye.y;
+    T.m[14] = -eye.z;
+
+    return Mat4_Multiply(R, T);
+}
+
+// projection matrices
+Mat4 Mat4_Perspective(float fov, float aspect, float near, float far) {
+    Mat4 res = { 0 };
+    float tanHalfFov = std::tan(fov / 2.0f);
+
+    res.m[0] = 1.0f / (aspect * tanHalfFov);
+    res.m[5] = 1.0f / tanHalfFov;
+    res.m[10] = -(far + near) / (far - near);
+    res.m[11] = -1.0f;
+    res.m[14] = -(2.0f * far * near) / (far - near);
+
+    return res;
+}
+
+// orthographic projection
+Mat4 Mat4_Orthographic(float left, float right, float bottom, float top, float near, float far) {
+    Mat4 res = Mat4_Identity();
+
+    res.m[0] = 2.0f / (right - left);
+    res.m[5] = 2.0f / (top - bottom);
+    res.m[10] = -2.0f / (far - near);
+    res.m[12] = -(right + left) / (right - left);
+    res.m[13] = -(top + bottom) / (top - bottom);
+    res.m[14] = -(far + near) / (far - near);
+
+    return res;
+}
+
+Vec4 Mat4_Multiply_Vec4(const Mat4& M, const Vec4& V) {
+    Vec4 R = { 0.0f, 0.0f, 0.0f, 0.0f };
+    R.x = M.m[0] * V.x + M.m[4] * V.y + M.m[8] * V.z + M.m[12] * V.w;
+    R.y = M.m[1] * V.x + M.m[5] * V.y + M.m[9] * V.z + M.m[13] * V.w;
+    R.z = M.m[2] * V.x + M.m[6] * V.y + M.m[10] * V.z + M.m[14] * V.w;
+    R.w = M.m[3] * V.x + M.m[7] * V.y + M.m[11] * V.z + M.m[15] * V.w;
+    return R;
+}
+
+struct Vertex {
+    Vec3 position;
+    Vec3 normal;
+}; 
+
+struct FaceData {
+    unsigned int v1, v2, v3;
+    Vec3 normal;
+};
+
+struct LightProperties {
+    Vec4 ambient;
+    Vec4 diffuse;
+    Vec4 specular;
+    Vec3 position; 
+};
+
+struct Material {
+    Vec4 ambient;
+    Vec4 diffuse;
+    Vec4 specular;
+    float shininess;
+};
+
+const std::vector<Material> predefined_materials = {
+    // Material 0: High Specula 
+    {
+        {0.1f, 0.1f, 0.1f, 1.0f}, 
+        {0.7f, 0.7f, 0.7f, 1.0f}, 
+        {1.0f, 1.0f, 1.0f, 1.0f}, 
+        100.0f                    
+    },
+    // Material 1: Red 
+    {
+        {0.6f, 0.2f, 0.2f, 1.0f}, 
+        {0.9f, 0.1f, 0.1f, 1.0f}, 
+        {0.8f, 0.8f, 0.8f, 1.0f}, 
+        80.0f                     
+    },
+    // Material 2: Bronze
+    {
+        {0.2125f, 0.1275f, 0.054f, 1.0f},
+        {0.714f, 0.4284f, 0.18144f, 1.0f},
+        {0.393548f, 0.271906f, 0.166721f, 1.0f},
+        25.6f
+    }
+};
+
+// Light properties 
+const Vec4 global_ambient = { 0.1f, 0.1f, 0.1f, 1.0f }; 
+const LightProperties light_default_props = {
+    {0.2f, 0.2f, 0.2f, 1.0f}, 
+    {0.6f, 0.6f, 0.6f, 1.0f}, 
+    {1.0f, 1.0f, 1.0f, 1.0f}, 
+    {0.0f, 0.0f, 0.0f}       
+};
+
+std::vector<Vertex> vertices;
+std::vector<FaceData> faces;
+std::vector<float> vertexBufferData;
+
+void framebuffer_size_callback(GLFWwindow* window, int width, int height);
+void checkShaderCompileErrors(unsigned int shader, std::string type);
+void setupShaders();
+
+// SMF loader
+void loadSMF(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "ERROR::SMF_LOADER::File not successfully read: " << filename << std::endl;
+        exit(-1);
+    }
+
+    vertices.clear();
+    faces.clear();
+    std::string line;
+    while (std::getline(file, line)) {
+        std::stringstream ss(line);
+        std::string type;
+        ss >> type;
+
+        if (type == "v") {
+            float x, y, z;
+            ss >> x >> y >> z;
+            vertices.push_back({ {x, y, z}, {0.0f, 0.0f, 0.0f} });
+        }
+        else if (type == "f") {
+            unsigned int v1, v2, v3;
+            ss >> v1 >> v2 >> v3;
+            faces.push_back({ v1 - 1, v2 - 1, v3 - 1, {0.0f, 0.0f, 0.0f} });
+        }
+    }
+
+    file.close();
+    std::cout << "Model loaded: " << vertices.size() << " vertices, " << faces.size() << " triangles." << std::endl;
+}
+
+// model processing
+void calculateFaceNormals() {
+    for (auto& face : faces) {
+        Vec3 p1 = vertices[face.v1].position;
+        Vec3 p2 = vertices[face.v2].position;
+        Vec3 p3 = vertices[face.v3].position;
+
+        Vec3 edge1 = p2 - p1;
+        Vec3 edge2 = p3 - p1;
+
+        Vec3 normal = cross(edge1, edge2);
+
+        // Store the raw face normal
+        face.normal = normal;
+    }
+}
+
+void averageVertexNormals() {
+    for (auto& vertex : vertices) {
+        vertex.normal = { 0.0f, 0.0f, 0.0f };
+    }
+
+    for (const auto& face : faces) {
+        Vec3 face_normal = normalize(face.normal);
+
+        vertices[face.v1].normal = vertices[face.v1].normal + face_normal;
+        vertices[face.v2].normal = vertices[face.v2].normal + face_normal;
+        vertices[face.v3].normal = vertices[face.v3].normal + face_normal;
+    }
+
+    for (auto& vertex : vertices) {
+        vertex.normal = normalize(vertex.normal);
+    }
+}
+
+
+// buffer setup
+void setupBuffers() {
+    vertexBufferData.clear();
+    vertexBufferData.reserve(faces.size() * 3 * 6);
+
+    for (const auto& face : faces) {
+        for (int i = 0; i < 3; ++i) {
+            unsigned int v_index = (i == 0) ? face.v1 : ((i == 1) ? face.v2 : face.v3);
+            const Vec3& pos = vertices[v_index].position;
+            const Vec3& normal = vertices[v_index].normal;
+
+            vertexBufferData.push_back(pos.x);
+            vertexBufferData.push_back(pos.y);
+            vertexBufferData.push_back(pos.z);
+
+            vertexBufferData.push_back(normal.x);
+            vertexBufferData.push_back(normal.y);
+            vertexBufferData.push_back(normal.z);
+        }
+    }
+
+    if (VAO == 0) glGenVertexArrays(1, &VAO);
+    if (VBO == 0) glGenBuffers(1, &VBO);
+
+    glBindVertexArray(VAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, vertexBufferData.size() * sizeof(float), vertexBufferData.data(), GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+}
+
+// matrix updates
+Mat4 updateViewMatrix() {
+    const Vec3 lookAtPoint = { 0.0f, 0.0f, 0.0f };
+    const Vec3 upVector = { 0.0f, 1.0f, 0.0f };
+
+    float x = camera_radius * std::cos(camera_angle);
+    float z = camera_radius * std::sin(camera_angle);
+    float y = camera_height;
+
+    Vec3 cameraPos = { x, y, z };
+
+    return Mat4_LookAt(cameraPos, lookAtPoint, upVector);
+}
+
+// projection matrix update
+Mat4 updateProjectionMatrix(float aspect) {
+    if (is_perspective) {
+        return Mat4_Perspective(PI / 4.0f, aspect, 0.1f, 100.0f);
+    }
+    else {
+        float size = camera_radius / 3.0f;
+        return Mat4_Orthographic(-size * aspect, size * aspect, -size, size, 0.1f, 100.0f);
+    }
+}
+
+
+// Uniform helper: Material
+void setMaterialUniforms(GLuint program, const Material& material) {
+    glUseProgram(program);
+    glUniform4f(glGetUniformLocation(program, "material.ambient"), material.ambient.x, material.ambient.y, material.ambient.z, material.ambient.w);
+    glUniform4f(glGetUniformLocation(program, "material.diffuse"), material.diffuse.x, material.diffuse.y, material.diffuse.z, material.diffuse.w);
+    glUniform4f(glGetUniformLocation(program, "material.specular"), material.specular.x, material.specular.y, material.specular.z, material.specular.w);
+    glUniform1f(glGetUniformLocation(program, "material.shininess"), material.shininess);
+}
+
+// Uniform helper: Lights
+void setLightUniforms(GLuint program, const Mat4& viewMatrix, const Vec3& cameraPos) {
+    glUseProgram(program);
+
+    // Light 1 (World Coordinates - Cylindrical Motion)
+    float x1 = light1_radius * std::cos(light1_angle);
+    float z1 = light1_radius * std::sin(light1_angle);
+    float y1 = light1_height;
+    Vec3 light1PosWorld = { x1, y1, z1 }; // Light 1 position in WORLD space
+
+    // Transform Light 1 World Position to EYE space: V * L_world
+    Vec4 light1PosWorld4 = { light1PosWorld.x, light1PosWorld.y, light1PosWorld.z, 1.0f };
+    Vec4 light1PosEye4 = Mat4_Multiply_Vec4(viewMatrix, light1PosWorld4);
+
+    // Light 1 Uniforms
+    glUniform4f(glGetUniformLocation(program, "light1.ambient"), light_default_props.ambient.x, light_default_props.ambient.y, light_default_props.ambient.z, light_default_props.ambient.w);
+    glUniform4f(glGetUniformLocation(program, "light1.diffuse"), light_default_props.diffuse.x, light_default_props.diffuse.y, light_default_props.diffuse.z, light_default_props.diffuse.w);
+    glUniform4f(glGetUniformLocation(program, "light1.specular"), light_default_props.specular.x, light_default_props.specular.y, light_default_props.specular.z, light_default_props.specular.w);
+    glUniform3f(glGetUniformLocation(program, "light1.position"), light1PosEye4.x, light1PosEye4.y, light1PosEye4.z);
+
+    // Light 2 Uniforms (Already in Camera/Eye Space)
+    glUniform4f(glGetUniformLocation(program, "light2.ambient"), light_default_props.ambient.x, light_default_props.ambient.y, light_default_props.ambient.z, light_default_props.ambient.w);
+    glUniform4f(glGetUniformLocation(program, "light2.diffuse"), light_default_props.diffuse.x, light_default_props.diffuse.y, light_default_props.diffuse.z, light_default_props.diffuse.w);
+    glUniform4f(glGetUniformLocation(program, "light2.specular"), light_default_props.specular.x, light_default_props.specular.y, light_default_props.specular.z, light_default_props.specular.w);
+    glUniform3f(glGetUniformLocation(program, "light2.position"), light2_position_cam.x, light2_position_cam.y, light2_position_cam.z);
+
+    // Global ambient
+    glUniform4f(glGetUniformLocation(program, "globalAmbient"), global_ambient.x, global_ambient.y, global_ambient.z, global_ambient.w);
+}
+
+// Shader Code for Gouraud Shading
+const char* gouraudVertexShaderSource = R"(
+    #version 330 core
+    layout (location = 0) in vec3 aPos;
+    layout (location = 1) in vec3 aNormal;
+
+    uniform mat4 model;
+    uniform mat4 view;
+    uniform mat4 projection;
+
+    // Material properties
+    struct Material {
+        vec4 ambient;
+        vec4 diffuse;
+        vec4 specular;
+        float shininess;
+    };
+    uniform Material material;
+
+    // Light properties
+    struct Light {
+        vec4 ambient;
+        vec4 diffuse;
+        vec4 specular;
+        vec3 position; // Position in EYE coordinates
+    };
+    uniform Light light1;
+    uniform Light light2;
+    uniform vec4 globalAmbient;
+
+    out vec4 fragColor;
+
+    vec4 calculateLighting(Light light, vec3 normal, vec3 fragPos) {
+        // Ambient (Light * Material)
+        vec4 ambient = light.ambient * material.ambient;
+        
+        // Light direction is from fragment to light
+        vec3 L = normalize(light.position - fragPos);
+
+        // Diffuse component (Lambert's law)
+        float diff = max(dot(normal, L), 0.0);
+        vec4 diffuse = light.diffuse * material.diffuse * diff;
+
+        // Specular component (Phong reflection model)
+        vec3 V = normalize(-fragPos); // View direction is from fragment to camera (origin in Eye Space)
+        vec3 R = reflect(-L, normal);  
+        float spec = pow(max(dot(V, R), 0.0), material.shininess);
+        vec4 specular = light.specular * material.specular * spec;
+
+        // Final color contribution from this light
+        return ambient + diffuse + specular;
+    }
+
+    void main() {
+        // Transform vertex position to Eye Coordinates
+        vec4 fragPos4 = view * model * vec4(aPos, 1.0);
+        vec3 fragPos = vec3(fragPos4) / fragPos4.w; // w is 1.0 since model is identity and position is 1.0
+
+        // Transform normal to Eye Coordinates. Use mat3(view) since View is a rigid body transform.
+        vec3 normal = normalize(mat3(view) * aNormal); 
+
+        // Gouraud: Calculate final color in Vertex Shader
+        vec4 finalColor = globalAmbient * material.ambient; // Global ambient base
+        finalColor += calculateLighting(light1, normal, fragPos);
+        finalColor += calculateLighting(light2, normal, fragPos); // Add second light
+
+        fragColor = finalColor;
+        gl_Position = projection * view * model * vec4(aPos, 1.0);
+    }
+)";
+
+const char* gouraudFragmentShaderSource = R"(
+    #version 330 core
+    in vec4 fragColor;
+    out vec4 FragColor;
+
+    void main() {
+        FragColor = fragColor; // Pass the interpolated color directly
+    }
+)";
+
+
+// Shader Code for Phong Shading
+const char* phongVertexShaderSource = R"(
+    #version 330 core
+    layout (location = 0) in vec3 aPos;
+    layout (location = 1) in vec3 aNormal;
+
+    uniform mat4 model;
+    uniform mat4 view;
+    uniform mat4 projection;
+    
+    out vec3 normal_eye;
+    out vec3 fragPos_eye;
+
+    void main() {
+        // Transform position to Eye Coordinates
+        vec4 fragPos4 = view * model * vec4(aPos, 1.0);
+        fragPos_eye = vec3(fragPos4) / fragPos4.w;
+        
+        // Transform normal to Eye Coordinates (mat3(view) is inverse transpose of ModelView for rigid body)
+        normal_eye = mat3(view) * aNormal; 
+        
+        gl_Position = projection * view * model * vec4(aPos, 1.0);
+    }
+)";
+
+const char* phongFragmentShaderSource = R"(
+    #version 330 core
+    in vec3 normal_eye;
+    in vec3 fragPos_eye;
+
+    out vec4 FragColor;
+
+    // Material properties
+    struct Material {
+        vec4 ambient;
+        vec4 diffuse;
+        vec4 specular;
+        float shininess;
+    };
+    uniform Material material;
+
+    // Light properties
+    struct Light {
+        vec4 ambient;
+        vec4 diffuse;
+        vec4 specular;
+        vec3 position; // Position in EYE coordinates
+    };
+    uniform Light light1;
+    uniform Light light2;
+    uniform vec4 globalAmbient;
+
+    // Phong: Calculate lighting in Fragment Shader
+    vec4 calculateLighting(Light light, vec3 normal, vec3 fragPos) {
+        vec4 color = vec4(0.0);
+        
+        vec3 N = normalize(normal);
+        
+        // Light direction
+        vec3 L = normalize(light.position - fragPos);
+
+        // Ambient component
+        vec4 ambient = light.ambient * material.ambient;
+
+        // Diffuse component
+        float diff = max(dot(N, L), 0.0);
+        vec4 diffuse = light.diffuse * material.diffuse * diff;
+
+        // Specular component
+        vec3 V = normalize(-fragPos); // View direction
+        vec3 R = reflect(-L, N);  
+        float spec = pow(max(dot(V, R), 0.0), material.shininess);
+        vec4 specular = light.specular * material.specular * spec;
+
+        color += ambient + diffuse + specular;
+        return color;
+    }
+
+    void main() {
+        vec4 finalColor = globalAmbient * material.ambient; // Global ambient base
+        
+        finalColor += calculateLighting(light1, normal_eye, fragPos_eye);
+        finalColor += calculateLighting(light2, normal_eye, fragPos_eye);
+        
+        FragColor = vec4(finalColor.xyz, 1.0f);
+    }
+)";
+
+// check for shader compilation/linking errors
+void checkShaderCompileErrors(unsigned int shader, std::string type) {
+    int success;
+    char infoLog[1024];
+    if (type != "PROGRAM") {
+        glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+        if (!success) {
+            glGetShaderInfoLog(shader, 1024, NULL, infoLog);
+            std::cerr << "ERROR::SHADER_COMPILATION_ERROR of type: " << type << "\n" << infoLog << "\n" << std::endl;
+        }
+    }
+    else {
+        glGetProgramiv(shader, GL_LINK_STATUS, &success);
+        if (!success) {
+            glGetProgramInfoLog(shader, 1024, NULL, infoLog);
+            std::cerr << "ERROR::PROGRAM_LINKING_ERROR of type: " << type << "\n" << infoLog << "\n" << std::endl;
+        }
+    }
+}
+
+// shader setup
+void setupShaders() {
+    // Gouraud Shaders
+    unsigned int gouraudVertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(gouraudVertexShader, 1, &gouraudVertexShaderSource, NULL);
+    glCompileShader(gouraudVertexShader);
+    checkShaderCompileErrors(gouraudVertexShader, "GOURAUD_VERTEX");
+
+    unsigned int gouraudFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(gouraudFragmentShader, 1, &gouraudFragmentShaderSource, NULL);
+    glCompileShader(gouraudFragmentShader);
+    checkShaderCompileErrors(gouraudFragmentShader, "GOURAUD_FRAGMENT");
+
+    shaderProgram_gouraud = glCreateProgram();
+    glAttachShader(shaderProgram_gouraud, gouraudVertexShader);
+    glAttachShader(shaderProgram_gouraud, gouraudFragmentShader);
+    glLinkProgram(shaderProgram_gouraud);
+    checkShaderCompileErrors(shaderProgram_gouraud, "GOURAUD_PROGRAM");
+
+    glDeleteShader(gouraudVertexShader);
+    glDeleteShader(gouraudFragmentShader);
+
+    // Phong Shaders
+    unsigned int phongVertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(phongVertexShader, 1, &phongVertexShaderSource, NULL);
+    glCompileShader(phongVertexShader);
+    checkShaderCompileErrors(phongVertexShader, "PHONG_VERTEX");
+
+    unsigned int phongFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(phongFragmentShader, 1, &phongFragmentShaderSource, NULL);
+    glCompileShader(phongFragmentShader);
+    checkShaderCompileErrors(phongFragmentShader, "PHONG_FRAGMENT");
+
+    shaderProgram_phong = glCreateProgram();
+    glAttachShader(shaderProgram_phong, phongVertexShader);
+    glAttachShader(shaderProgram_phong, phongFragmentShader);
+    glLinkProgram(shaderProgram_phong);
+    checkShaderCompileErrors(shaderProgram_phong, "PHONG_PROGRAM");
+
+    glDeleteShader(phongVertexShader);
+    glDeleteShader(phongFragmentShader);
+}
+
+// process input
+void processInput(GLFWwindow* window) {
+    float current_time = (float)glfwGetTime();
+
+    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        glfwSetWindowShouldClose(window, true);
+
+    float camera_speed = 0.05f;
+    float angle_speed = 0.02f;
+
+    // Camera controls
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+        camera_angle += angle_speed;
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+        camera_angle -= angle_speed;
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+        camera_radius = std::max(0.5f, camera_radius - camera_speed);
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+        camera_radius += camera_speed;
+    if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS)
+        camera_height += camera_speed;
+    if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS)
+        camera_height -= camera_speed;
+
+    // Projection toggle (P)
+    if (glfwGetKey(window, GLFW_KEY_P) == GLFW_PRESS && current_time - last_key_press_time > key_debounce_time) {
+        is_perspective = !is_perspective;
+        last_key_press_time = current_time;
+        std::cout << "Projection switched to: " << (is_perspective ? "Perspective" : "Parallel (Orthographic)") << std::endl;
+    }
+
+    // Part 2: Shading Mode Toggle (G for Gouraud, F for Phong)
+    if (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS && current_time - last_key_press_time > key_debounce_time) {
+        current_shading_mode = GOURAUD;
+        last_key_press_time = current_time;
+        std::cout << "Shading switched to: Gouraud\n";
+    }
+    if (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS && current_time - last_key_press_time > key_debounce_time) {
+        current_shading_mode = PHONG;
+        last_key_press_time = current_time;
+        std::cout << "Shading switched to: Phong\n";
+    }
+
+    // Part 2: Material Toggle (M)
+    if (glfwGetKey(window, GLFW_KEY_M) == GLFW_PRESS && current_time - last_key_press_time > key_debounce_time) {
+        current_material_index = (current_material_index + 1) % predefined_materials.size();
+        last_key_press_time = current_time;
+        std::cout << "Material switched to index: " << current_material_index << "\n";
+    }
+
+    // Part 2: Light 1 Position Control (J/L for angle, I/K for height, T/Y for radius)
+    float light_speed = 0.05f;
+    float light_angle_speed = 0.05f;
+
+    if (glfwGetKey(window, GLFW_KEY_J) == GLFW_PRESS) // Angle - CCW
+        light1_angle += light_angle_speed;
+    if (glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS) // Angle - CW
+        light1_angle -= light_angle_speed;
+    if (glfwGetKey(window, GLFW_KEY_I) == GLFW_PRESS) // Height - Up
+        light1_height += light_speed;
+    if (glfwGetKey(window, GLFW_KEY_K) == GLFW_PRESS) // Height - Down
+        light1_height -= light_speed;
+    if (glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS) // Radius - Out
+        light1_radius += light_speed;
+    if (glfwGetKey(window, GLFW_KEY_Y) == GLFW_PRESS) // Radius - In
+        light1_radius = std::max(0.5f, light1_radius - light_speed);
+}
+
+void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    glViewport(0, 0, width, height);
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <smf_filename>" << std::endl;
+        return -1;
+    }
+    std::string smf_filename = argv[1];
+
+    glfwInit();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Part 2: Gouraud/Phong Shading", NULL, NULL);
+    if (window == NULL) {
+        std::cerr << "Failed to create GLFW window" << std::endl;
+        glfwTerminate();
+        return -1;
+    }
+    glfwMakeContextCurrent(window);
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        std::cerr << "Failed to initialize GLAD" << std::endl;
+        return -1;
+    }
+
+    glEnable(GL_DEPTH_TEST);
+
+    loadSMF(smf_filename);
+    calculateFaceNormals();
+    averageVertexNormals();
+
+    setupShaders();
+    setupBuffers();
+
+    std::cout << "Controls:\n";
+    std::cout << " A/D: Camera Angle | W/S: Camera Radius | Up/Down: Camera Height | P: Toggle Projection\n";
+    std::cout << " G: Gouraud Shading | F: Phong Shading\n";
+    std::cout << " M: Next Material\n";
+    std::cout << " J/L: Light 1 Angle | I/K: Light 1 Height | T/Y: Light 1 Radius\n";
+
+    // rendering loop
+    while (!glfwWindowShouldClose(window)) {
+        processInput(window);
+
+        glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        GLuint currentProgram = (current_shading_mode == GOURAUD) ? shaderProgram_gouraud : shaderProgram_phong;
+        glUseProgram(currentProgram);
+
+        Mat4 model = Mat4_Identity();
+        Mat4 view = updateViewMatrix();
+
+        float x_cam = camera_radius * std::cos(camera_angle);
+        float z_cam = camera_radius * std::sin(camera_angle);
+        float y_cam = camera_height;
+        Vec3 cameraPos = { x_cam, y_cam, z_cam };
+
+        int width, height;
+        glfwGetFramebufferSize(window, &width, &height);
+        float aspect = (float)width / (float)height;
+        Mat4 projection = updateProjectionMatrix(aspect);
+
+        glUniformMatrix4fv(glGetUniformLocation(currentProgram, "model"), 1, GL_FALSE, model.m);
+        glUniformMatrix4fv(glGetUniformLocation(currentProgram, "view"), 1, GL_FALSE, view.m);
+        glUniformMatrix4fv(glGetUniformLocation(currentProgram, "projection"), 1, GL_FALSE, projection.m);
+
+        setLightUniforms(currentProgram, view, cameraPos);
+        setMaterialUniforms(currentProgram, predefined_materials[current_material_index]);
+
+        glBindVertexArray(VAO);
+        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)faces.size() * 3);
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    glDeleteVertexArrays(1, &VAO);
+    glDeleteBuffers(1, &VBO);
+    glDeleteProgram(shaderProgram_gouraud);
+    glDeleteProgram(shaderProgram_phong);
+
+    glfwTerminate();
+    return 0;
+}
